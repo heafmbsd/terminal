@@ -4,6 +4,8 @@
 #include "pch.h"
 #include "AtlasEngine.h"
 
+#include <til/rle.h>
+
 #include "../../interactivity/win32/CustomWindowMessages.h"
 
 #include "shader_vs.h"
@@ -49,54 +51,124 @@ static void getLocaleNameImpl(wchar_t (&localeName)[LOCALE_NAME_MAX_LENGTH])
         static constexpr wchar_t fallback[] = L"en-US";
         memcpy(localeName, fallback, sizeof(fallback));
     }
-    // GetUserDefaultLocaleName can return bullshit locales with trailing underscores. Strip it off.
     // See: https://docs.microsoft.com/en-us/windows/win32/intl/locale-names
+    // "A locale name is based on the language tagging conventions of RFC 4646."
+    // That said these locales aren't RFC 4646 as they contain a trailing "_<sort order>".
+    // I'm stripping those as I don't want to find out whether something like DWrite can't handle it.
     else if (auto p = wcschr(localeName, L'_'))
     {
         *p = L'\0';
     }
 }
 
-static uint32_t utf16utf32(const std::wstring_view& str)
+struct TextAnalyzer final : IDWriteTextAnalysisSource, IDWriteTextAnalysisSink
 {
-    uint32_t codepoint;
-#pragma warning(suppress : 26446) // Prefer to use gsl::at() instead of unchecked subscript operator (bounds.4).
-    switch (str.size())
-    {
-    case 1:
-        codepoint = str[0];
-        break;
-    case 2:
-        codepoint = (str[0] & 0x3FF) << 10;
-        codepoint |= str[1] & 0x3FF;
-        codepoint += 0x10000;
-        break;
-    default:
-        codepoint = 0xFFFD; // UNICODE_REPLACEMENT
-        break;
-    }
-    return codepoint;
-}
+    constexpr TextAnalyzer(const std::wstring& text, const wchar_t* localeName, std::vector<AtlasEngine::TextAnalyzerResult>& results) noexcept :
+        _text(text), _localeName(localeName), _results(results) {}
 
-static uint32_t utf32utf16(uint32_t in, wchar_t (&out)[2])
-{
-    if (in < 0x10000)
+    void Analyze(IDWriteTextAnalyzer* textAnalyzer, UINT32 textPosition, UINT32 textLength)
     {
-        out[0] = static_cast<wchar_t>(in);
+        _results.clear();
+        textAnalyzer->AnalyzeScript(this, textPosition, textLength, this);
+        //textAnalyzer->AnalyzeBidi(this, textPosition, textLength, this);
+    }
+
+    HRESULT __stdcall QueryInterface(REFIID riid, _COM_Outptr_ void** ppvObject) noexcept override
+    {
+        if (IsEqualGUID(riid, __uuidof(IDWriteTextAnalysisSource)) || IsEqualGUID(riid, __uuidof(IDWriteTextAnalysisSink)))
+        {
+            *ppvObject = this;
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG __stdcall AddRef() noexcept override
+    {
+        assert(false);
         return 1;
     }
 
-    in -= 0x10000;
-    out[0] = static_cast<wchar_t>(0xD800 + (in >> 10));
-    out[1] = static_cast<wchar_t>(0xDC00 + (in & 0x3FF));
-    return 2;
-}
+    ULONG __stdcall Release() noexcept override
+    {
+        assert(false);
+        return 1;
+    }
+
+    HRESULT __stdcall GetTextAtPosition(UINT32 textPosition, _Outptr_result_buffer_(*textLength) WCHAR const** textString, _Out_ UINT32* textLength) noexcept override
+    {
+        *textString = _text.data() + textPosition;
+        *textLength = static_cast<UINT32>(_text.size() - textPosition);
+        return S_OK;
+    }
+
+    HRESULT __stdcall GetTextBeforePosition(UINT32 textPosition, _Outptr_result_buffer_(*textLength) WCHAR const** textString, _Out_ UINT32* textLength) noexcept override
+    {
+        *textString = _text.data();
+        *textLength = textPosition;
+        return S_OK;
+    }
+
+    DWRITE_READING_DIRECTION __stdcall GetParagraphReadingDirection() noexcept override
+    {
+        return DWRITE_READING_DIRECTION_LEFT_TO_RIGHT;
+    }
+
+    HRESULT __stdcall GetLocaleName(UINT32 textPosition, _Out_ UINT32* textLength, _Outptr_result_z_ WCHAR const** localeName) noexcept override
+    {
+        *textLength = gsl::narrow_cast<UINT32>(_text.size()) - textPosition;
+        *localeName = _localeName;
+        return S_OK;
+    }
+
+    HRESULT __stdcall GetNumberSubstitution(UINT32 textPosition, _Out_ UINT32* textLength, _COM_Outptr_ IDWriteNumberSubstitution** numberSubstitution) noexcept override
+    {
+        *textLength = gsl::narrow_cast<UINT32>(_text.size()) - textPosition;
+        *numberSubstitution = nullptr;
+        return E_NOTIMPL;
+    }
+
+    HRESULT __stdcall SetScriptAnalysis(UINT32 textPosition, UINT32 textLength, _In_ DWRITE_SCRIPT_ANALYSIS const* scriptAnalysis) noexcept override
+    try
+    {
+        _results.emplace_back(AtlasEngine::TextAnalyzerResult{ textPosition, textLength, scriptAnalysis->script, static_cast<UINT8>(scriptAnalysis->shapes), 0 });
+        return S_OK;
+    }
+    CATCH_RETURN()
+
+    HRESULT __stdcall SetLineBreakpoints(UINT32 textPosition, UINT32 textLength, _In_reads_(textLength) DWRITE_LINE_BREAKPOINT const* lineBreakpoints) noexcept override
+    {
+        return E_NOTIMPL;
+    }
+
+    HRESULT __stdcall SetBidiLevel(UINT32 textPosition, UINT32 textLength, UINT8 explicitLevel, UINT8 resolvedLevel) noexcept override
+    {
+        return E_NOTIMPL;
+    }
+
+    HRESULT __stdcall SetNumberSubstitution(UINT32 textPosition, UINT32 textLength, _In_ IDWriteNumberSubstitution* numberSubstitution) noexcept override
+    {
+        return E_NOTIMPL;
+    }
+
+private:
+    const std::wstring& _text;
+    const wchar_t* const _localeName;
+    std::vector<AtlasEngine::TextAnalyzerResult>& _results;
+};
 
 AtlasEngine::AtlasEngine()
 {
-    THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, _uuidof(_sr.d2dFactory), _sr.d2dFactory.put_void()));
-    THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(_sr.dwriteFactory), _sr.dwriteFactory.put_unknown()));
+    THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, _uuidof(_sr.d2dFactory), reinterpret_cast<void**>(_sr.d2dFactory.addressof())));
+    THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(_sr.dwriteFactory), reinterpret_cast<::IUnknown**>(_sr.dwriteFactory.addressof())));
+    THROW_IF_FAILED(_sr.dwriteFactory.query<IDWriteFactory2>()->GetSystemFontFallback(_sr.systemFontFallback.addressof()));
+    {
+        wil::com_ptr<IDWriteTextAnalyzer> textAnalyzer;
+        THROW_IF_FAILED(_sr.dwriteFactory->CreateTextAnalyzer(textAnalyzer.addressof()));
+        _sr.textAnalyzer = textAnalyzer.query<IDWriteTextAnalyzer1>();
+    }
     _sr.isWindows10OrGreater = IsWindows10OrGreater();
+
     _r.glyphQueue.reserve(64);
 }
 
@@ -308,42 +380,28 @@ CATCH_RETURN()
 [[nodiscard]] HRESULT AtlasEngine::PaintBufferLine(const gsl::span<const Cluster> clusters, const COORD coord, const bool fTrimLeft, const bool lineWrapped) noexcept
 try
 {
-    auto data = _getCell(coord.X, coord.Y);
-    for (const auto& cluster : clusters)
     {
-        const auto codepoint = utf16utf32(cluster.GetText());
-        const uint32_t wide = cluster.GetColumns() != 1;
-        const uint32_t cells = wide + 1;
+        _rapi.bufferLine.clear();
+        _rapi.bufferLinePos.clear();
 
-        auto entry = _rapi.attributes;
-        entry.codepoint = codepoint;
-        entry.wide = wide;
-
-        auto& coords = _r.glyphs[entry];
-        if (coords[0] == u16x2{})
+        u16 column = 0;
+        for (const auto& cluster : clusters)
         {
-            coords[0] = _allocateAtlasCell();
-            if (wide)
+            const auto text = cluster.GetText();
+
+            _rapi.bufferLine.append(text);
+            for (size_t i = 0; i < text.size(); ++i)
             {
-                coords[1] = _allocateAtlasCell();
+                _rapi.bufferLinePos.emplace_back(column);
             }
-            _r.glyphQueue.emplace_back(entry, coords);
+
+            column += gsl::narrow_cast<u16>(cluster.GetColumns());
         }
 
-        static_assert(sizeof(data->glyphIndex) == sizeof(coords[0]));
-
-        for (uint32_t i = 0; i < cells; ++i)
-        {
-            data[i].glyphIndex16 = coords[i];
-            data[i].flags = 0;
-            data[i].color = _rapi.currentColor;
-        }
-
-#pragma warning(suppress : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).
-        data += cluster.GetColumns();
+        _rapi.bufferLinePos.emplace_back(column);
     }
 
-    assert(data <= (_r.cells.data() + _r.cells.size()));
+    _processBufferLine(coord.Y);
     return S_OK;
 }
 CATCH_RETURN()
@@ -437,6 +495,7 @@ CATCH_RETURN()
     wil::unique_hfont hfont;
     COORD coordSize;
 
+    // This block of code (for GDI fonts) is unfinished.
     if (fontInfoDesired.IsDefaultRasterFont())
     {
         hfont.reset(static_cast<HFONT>(GetStockObject(OEM_FIXED_FONT)));
@@ -485,6 +544,7 @@ CATCH_RETURN()
     else
     {
         getLocaleName(localeName);
+
         const auto textFormat = _createTextFormat(
             fontInfoDesired.GetFaceName().c_str(),
             static_cast<DWRITE_FONT_WEIGHT>(fontInfoDesired.GetWeight()),
@@ -493,7 +553,7 @@ CATCH_RETURN()
             localeName);
 
         wil::com_ptr<IDWriteTextLayout> textLayout;
-        RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(L"M", 1, textFormat.get(), FLT_MAX, FLT_MAX, textLayout.put()));
+        RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(L"M", 1, textFormat.get(), FLT_MAX, FLT_MAX, textLayout.addressof()));
 
         DWRITE_TEXT_METRICS metrics;
         RETURN_IF_FAILED(textLayout->GetMetrics(&metrics));
@@ -531,7 +591,7 @@ CATCH_RETURN()
     RETURN_HR_IF_NULL(E_INVALIDARG, pResult);
 
     wil::com_ptr<IDWriteTextLayout> textLayout;
-    RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(glyph.data(), yolo_narrow<uint32_t>(glyph.size()), _getTextFormat(false, false), FLT_MAX, FLT_MAX, textLayout.put()));
+    RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(glyph.data(), yolo_narrow<uint32_t>(glyph.size()), _getTextFormat(false, false), FLT_MAX, FLT_MAX, textLayout.addressof()));
 
     DWRITE_TEXT_METRICS metrics;
     RETURN_IF_FAILED(textLayout->GetMetrics(&metrics));
@@ -680,6 +740,56 @@ void AtlasEngine::UpdateHyperlinkHoveredId(const uint16_t hoveredId) noexcept
 
 #pragma endregion
 
+#pragma region Helper classes
+
+// XXH3 for exactly 32 bytes.
+uint64_t AtlasEngine::XXH3_len_32_64b(const void* data) noexcept
+{
+    static constexpr uint64_t dataSize = 32;
+    static constexpr auto XXH3_mul128_fold64 = [](uint64_t lhs, uint64_t rhs) noexcept {
+        uint64_t lo, hi;
+
+#if defined(_M_AMD64)
+        lo = _umul128(lhs, rhs, &hi);
+#elif defined(_M_ARM64)
+        lo = lhs * rhs;
+        hi = __umulh(lhs, rhs);
+#else
+        const uint64_t lo_lo = __emulu(lhs, rhs);
+        const uint64_t hi_lo = __emulu(lhs >> 32, rhs);
+        const uint64_t lo_hi = __emulu(lhs, rhs >> 32);
+        const uint64_t hi_hi = __emulu(lhs >> 32, rhs >> 32);
+        const uint64_t cross = (lo_lo >> 32) + (hi_lo & 0xFFFFFFFF) + lo_hi;
+        hi = (hi_lo >> 32) + (cross >> 32) + hi_hi;
+        lo = (cross << 32) | (lo_lo & 0xFFFFFFFF);
+#endif
+
+        return lo ^ hi;
+    };
+
+    // If executed on little endian CPUs these 4 numbers will
+    // equal the first 32 byte of the original XXH3_kSecret.
+    static constexpr uint64_t XXH3_kSecret[4] = {
+        0xbe4ba423396cfeb8ull,
+        0x1cad21f72c81017cull,
+        0xdb979083e96dd4deull,
+        0x1f67b3b7a4a44072ull,
+    };
+
+    uint64_t inputs[4];
+    memcpy(&inputs[0], data, 32);
+
+    uint64_t acc = dataSize * 0x9E3779B185EBCA87ull;
+    acc += XXH3_mul128_fold64(inputs[0] ^ XXH3_kSecret[0], inputs[1] ^ XXH3_kSecret[1]);
+    acc += XXH3_mul128_fold64(inputs[2] ^ XXH3_kSecret[2], inputs[3] ^ XXH3_kSecret[3]);
+    acc = acc ^ (acc >> 37);
+    acc *= 0x165667919E3779F9ULL;
+    acc = acc ^ (acc >> 32);
+    return acc;
+}
+
+#pragma endregion
+
 [[nodiscard]] HRESULT AtlasEngine::_handleException(const wil::ResultException& exception) noexcept
 {
     const auto hr = exception.GetErrorCode();
@@ -697,7 +807,7 @@ void AtlasEngine::_createResources()
 #ifdef NDEBUG
     static constexpr
 #endif
-        auto deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED;
+        auto deviceFlags = D3D11_CREATE_DEVICE_SINGLETHREADED | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
 #ifndef NDEBUG
     // DXGI debug messages + enabling D3D11_CREATE_DEVICE_DEBUG if the Windows SDK was installed.
@@ -730,9 +840,9 @@ void AtlasEngine::_createResources()
             D3D_DRIVER_TYPE_WARP,
         };
         static constexpr std::array featureLevels{
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_11_0,
             D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
         };
 
         HRESULT hr = S_OK;
@@ -789,7 +899,7 @@ void AtlasEngine::_createResources()
         desc.Flags = supportsFrameLatencyWaitableObject ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
 
         wil::com_ptr<IDXGIFactory2> dxgiFactory;
-        THROW_IF_FAILED(CreateDXGIFactory1(IID_PPV_ARGS(dxgiFactory.put())));
+        THROW_IF_FAILED(CreateDXGIFactory1(IID_PPV_ARGS(dxgiFactory.addressof())));
 
         if (_api.hwnd)
         {
@@ -920,19 +1030,12 @@ void AtlasEngine::_recreateSizeDependentResources()
 void AtlasEngine::_recreateFontDependentResources()
 {
     {
-        static constexpr size_t glyphCellsRequired = 16 * 1024;
+        static constexpr size_t wantCells = 64 * 1024; // TODO
 
-        // I want my atlas texture to be square.
-        // Not just so that we can better fit into the current 8k/16k texture size limit,
-        // but also because that makes inspecting the texture in a debugger easier.
+        const size_t maxSize = _r.device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0 ? D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION : D3D10_REQ_TEXTURE2D_U_OR_V_DIMENSION;
         const size_t csx = _api.cellSize.x;
-        const size_t csy = _api.cellSize.y;
-        const auto areaRequired = glyphCellsRequired * csx * csy;
-        // I wrote a integer-based ceil(sqrt()) function but couldn't justify putting it into such a cold path.
-        const auto pxOptimal = static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(areaRequired))));
-        // We want to fit whole glyphs into our texture. --> Round up to fit entire glyphs in.
-        const auto xFit = (pxOptimal + csx - 1) / csx;
-        const auto yFit = (glyphCellsRequired + xFit - 1) / xFit;
+        const auto xFit = std::min(wantCells, maxSize / csx);
+        const auto yFit = (wantCells + xFit - 1) / xFit;
 
         _r.glyphs = {};
         _r.glyphQueue = {};
@@ -956,10 +1059,8 @@ void AtlasEngine::_recreateFontDependentResources()
         THROW_IF_FAILED(_r.device->CreateShaderResourceView(_r.glyphBuffer.get(), nullptr, _r.glyphView.put()));
     }
     {
-        // We only support regular narrow and wide characters at the moment.
-        // A width of cellSize.x*2 is thus enough.
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = _api.cellSize.x * 2;
+        desc.Width = _api.cellSize.x * 16;
         desc.Height = _api.cellSize.y;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
@@ -988,11 +1089,13 @@ void AtlasEngine::_recreateFontDependentResources()
     {
         static constexpr D2D1_COLOR_F color{ 1, 1, 1, 1 };
         wil::com_ptr<ID2D1SolidColorBrush> brush;
-        THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, brush.put()));
+        THROW_IF_FAILED(_r.d2dRenderTarget->CreateSolidColorBrush(&color, nullptr, brush.addressof()));
         _r.brush = brush.query<ID2D1Brush>();
     }
     {
         getLocaleName(localeName);
+        _r.localeName = { localeName };
+
         for (auto style = 0; style < 2; ++style)
         {
             for (auto weight = 0; weight < 2; ++weight)
@@ -1033,6 +1136,205 @@ void AtlasEngine::_updateConstantBuffer() const
     _r.deviceContext->UpdateSubresource(_r.constantBuffer.get(), 0, nullptr, &data, 0, 0);
 }
 
+void AtlasEngine::_processBufferLine(u16 y)
+{
+    TextAnalyzer atlasAnalyzer{ _rapi.bufferLine, _r.localeName.c_str(), _rapi.analysisResults };
+    const auto textSize = _rapi.bufferLine.size();
+    const auto projectedGlyphSize = 3 * textSize / 2 + 16;
+
+    if (_rapi.clusterMap.size() < textSize)
+    {
+        _rapi.clusterMap.resize(textSize);
+    }
+    if (_rapi.textProps.size() < textSize)
+    {
+        _rapi.textProps.resize(textSize);
+    }
+    if (_rapi.glyphIndices.size() < projectedGlyphSize)
+    {
+        _rapi.glyphIndices.resize(projectedGlyphSize);
+    }
+    if (_rapi.glyphProps.size() < projectedGlyphSize)
+    {
+        _rapi.glyphProps.resize(projectedGlyphSize);
+    }
+
+    const auto textFormat = _getTextFormat(_rapi.attributes.bold, _rapi.attributes.italic);
+
+    for (UINT32 idx = 0, mappedEnd; idx < textSize; idx = mappedEnd)
+    {
+        std::wstring familyName;
+        familyName.resize(textFormat->GetFontFamilyNameLength());
+        THROW_IF_FAILED(textFormat->GetFontFamilyName(familyName.data(), static_cast<UINT32>(familyName.size() + 1)));
+
+        wil::com_ptr<IDWriteFontCollection> fontCollection;
+        THROW_IF_FAILED(textFormat->GetFontCollection(fontCollection.addressof()));
+
+        UINT32 mappedLength;
+        wil::com_ptr<IDWriteFont> mappedFont;
+        float scale;
+        THROW_IF_FAILED(_sr.systemFontFallback->MapCharacters(
+            /* analysisSource     */ &atlasAnalyzer,
+            /* textPosition       */ idx,
+            /* textLength         */ gsl::narrow_cast<UINT32>(textSize) - idx,
+            /* baseFontCollection */ fontCollection.get(),
+            /* baseFamilyName     */ familyName.c_str(),
+            /* baseWeight         */ _rapi.attributes.bold ? DWRITE_FONT_WEIGHT_BOLD : static_cast<DWRITE_FONT_WEIGHT>(_api.fontWeight),
+            /* baseStyle          */ static_cast<DWRITE_FONT_STYLE>(_rapi.attributes.italic * DWRITE_FONT_STYLE_ITALIC),
+            /* baseStretch        */ DWRITE_FONT_STRETCH_NORMAL,
+            /* mappedLength       */ &mappedLength,
+            /* mappedFont         */ mappedFont.addressof(),
+            /* scale              */ &scale));
+        mappedEnd = idx + mappedLength;
+
+        if (!mappedFont)
+        {
+            // We can reuse idx here, as it'll be reset to "idx = mappedEnd" in the outer loop anyways.
+            auto beg = _rapi.bufferLinePos[idx++];
+            for (; idx <= mappedEnd; ++idx)
+            {
+                const auto cur = _rapi.bufferLinePos[idx];
+                if (beg != cur)
+                {
+                    static constexpr auto replacement = L'\uFFFD';
+                    _emplaceGlyph(&replacement, 1, y, beg, cur);
+                    beg = cur;
+                }
+            }
+
+            continue;
+        }
+
+        wil::com_ptr<IDWriteFontFace> mappedFontFace;
+        THROW_IF_FAILED(mappedFont->CreateFontFace(mappedFontFace.addressof()));
+
+        // We can reuse idx here, as it'll be reset to "idx = mappedEnd" in the outer loop anyways.
+        for (UINT32 complexityLength; idx < mappedEnd; idx += complexityLength)
+        {
+            BOOL isTextSimple;
+            THROW_IF_FAILED(_sr.textAnalyzer->GetTextComplexity(_rapi.bufferLine.data() + idx, mappedEnd - idx, mappedFontFace.get(), &isTextSimple, &complexityLength, _rapi.glyphIndices.data()));
+
+            if (isTextSimple)
+            {
+                for (UINT32 i = 0; i < complexityLength; ++i)
+                {
+                    _emplaceGlyph(&_rapi.bufferLine[idx + i], 1, y, _rapi.bufferLinePos[idx + i], _rapi.bufferLinePos[idx + i + 1]);
+                }
+            }
+            else
+            {
+                atlasAnalyzer.Analyze(_sr.textAnalyzer.get(), idx, complexityLength);
+
+                for (const auto& a : _rapi.analysisResults)
+                {
+                    DWRITE_SCRIPT_ANALYSIS scriptAnalysis{ a.script, static_cast<DWRITE_SCRIPT_SHAPES>(a.shapes) };
+                    UINT32 actualGlyphCount;
+
+                    for (auto retry = 0;;)
+                    {
+                        const auto hr = _sr.textAnalyzer->GetGlyphs(
+                            /* textString          */ _rapi.bufferLine.data() + a.textPosition,
+                            /* textLength          */ a.textLength,
+                            /* fontFace            */ mappedFontFace.get(),
+                            /* isSideways          */ false,
+                            /* isRightToLeft       */ a.bidiLevel & 1,
+                            /* scriptAnalysis      */ &scriptAnalysis,
+                            /* localeName          */ _r.localeName.c_str(),
+                            /* numberSubstitution  */ nullptr,
+                            /* features            */ nullptr,
+                            /* featureRangeLengths */ nullptr,
+                            /* featureRanges       */ 0,
+                            /* maxGlyphCount       */ gsl::narrow_cast<UINT32>(_rapi.glyphProps.size()),
+                            /* clusterMap          */ _rapi.clusterMap.data(),
+                            /* textProps           */ _rapi.textProps.data(),
+                            /* glyphIndices        */ _rapi.glyphIndices.data(),
+                            /* glyphProps          */ _rapi.glyphProps.data(),
+                            /* actualGlyphCount    */ &actualGlyphCount);
+
+                        if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && ++retry < 8)
+                        {
+                            // grow factor 1.5x
+                            auto size = _rapi.glyphProps.size();
+                            size = size + (size >> 1);
+                            _rapi.glyphIndices.resize(size);
+                            _rapi.glyphProps.resize(size);
+                            continue;
+                        }
+
+                        THROW_IF_FAILED(hr);
+                        break;
+                    }
+
+                    _rapi.textProps[a.textLength - 1].canBreakShapingAfter = 1;
+
+                    UINT32 beg = 0;
+                    for (UINT32 i = 0; i < a.textLength; ++i)
+                    {
+                        if (_rapi.textProps[i].canBreakShapingAfter)
+                        {
+                            _emplaceGlyph(&_rapi.bufferLine[a.textPosition + beg], i + 1 - beg, y, _rapi.bufferLinePos[a.textPosition + beg], _rapi.bufferLinePos[a.textPosition + i + 1]);
+                            beg = i + 1;
+                        }
+
+                        // TextLayout::GetFirstNonzeroWidthGlyph
+                        // Requires a call to GetDesignGlyphAdvances() ensuring that the glyphAdvance is >1.
+                    }
+                }
+            }
+        }
+    }
+}
+
+void AtlasEngine::_emplaceGlyph(const wchar_t* key, size_t keyLen, u16 y, u16 x1, u16 x2)
+{
+    assert(key);
+    assert(keyLen != 0);
+    assert(y < _api.cellCount.y);
+    assert(x1 < _api.cellCount.x);
+    assert(x2 <= _api.cellCount.x);
+    assert(x1 < x2);
+
+    auto data = _getCell(x1, y);
+    u16 cells = x2 - x1;
+
+    if (keyLen > 15)
+    {
+        keyLen = 15;
+    }
+
+    if (cells > 16)
+    {
+        cells = 16;
+    }
+
+    glyph_entry entry{};
+    memcpy(&entry.chars[0], key, keyLen * sizeof(wchar_t));
+    entry.attributes = _rapi.attributes;
+    entry.attributes.cells = cells - 1;
+
+    auto& coords = _r.glyphs[entry];
+    if (coords[0] == u16x2{})
+    {
+        for (u16 i = 0; i < cells; ++i)
+        {
+            coords[i] = _allocateAtlasCell();
+        }
+        _r.glyphQueue.emplace_back(entry, coords);
+    }
+
+    for (uint32_t i = 0; i < cells; ++i)
+    {
+        data[i].glyphIndex16 = coords[i];
+        data[i].flags = 0;
+        data[i].color = _rapi.currentColor;
+    }
+}
+
+IDWriteTextFormat* AtlasEngine::_getTextFormat(bool bold, bool italic) const noexcept
+{
+    return _r.textFormats[italic][bold].get();
+}
+
 wil::com_ptr<IDWriteTextFormat> AtlasEngine::_createTextFormat(const wchar_t* fontFamilyName, DWRITE_FONT_WEIGHT fontWeight, DWRITE_FONT_STYLE fontStyle, float fontSize, const wchar_t* localeName) const
 {
     wil::com_ptr<IDWriteTextFormat> textFormat;
@@ -1060,14 +1362,13 @@ AtlasEngine::u16x2 AtlasEngine::_allocateAtlasCell() noexcept
     return ret;
 }
 
-void AtlasEngine::_drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>& pair) const
+void AtlasEngine::_drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 16>>& pair) const
 {
-    wchar_t chars[2];
     const auto entry = pair.first;
-    const auto charsLength = utf32utf16(entry.codepoint, chars);
-    const auto cells = entry.wide + UINT32_C(1);
-    const bool bold = entry.bold;
-    const bool italic = entry.italic;
+    const auto charsLength = wcsnlen_s(&entry.chars[0], std::size(entry.chars));
+    const auto cells = entry.attributes.cells + UINT32_C(1);
+    const bool bold = entry.attributes.bold;
+    const bool italic = entry.attributes.italic;
     const auto textFormat = _getTextFormat(bold, italic);
 
     D2D1_RECT_F rect;
@@ -1079,7 +1380,7 @@ void AtlasEngine::_drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>&
     {
         // See D2DFactory::DrawText
         wil::com_ptr<IDWriteTextLayout> textLayout;
-        THROW_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(chars, charsLength, textFormat, rect.right, rect.bottom, textLayout.put()));
+        THROW_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(&entry.chars[0], gsl::narrow_cast<UINT32>(charsLength), textFormat, rect.right, rect.bottom, textLayout.addressof()));
 
         _r.d2dRenderTarget->BeginDraw();
         _r.d2dRenderTarget->Clear();

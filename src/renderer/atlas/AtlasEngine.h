@@ -6,6 +6,8 @@
 #include <d2d1.h>
 #include <d3d11_1.h>
 #include <dwrite.h>
+#include <dwrite_1.h>
+#include <dwrite_2.h>
 #include <dxgi.h>
 
 #include <robin_hood.h>
@@ -89,6 +91,19 @@ namespace Microsoft::Console::Render
         // Some helper classes for the implementation.
         // public because I don't want to sprinkle the code with friends.
     public:
+        struct TextAnalyzerResult
+        {
+            UINT32 textPosition;
+            UINT32 textLength;
+
+            // These fields represent DWRITE_SCRIPT_ANALYSIS.
+            // Not using DWRITE_SCRIPT_ANALYSIS drops the struct size from 12 down to 4 bytes.
+            UINT16 script;
+            UINT8 shapes;
+
+            UINT8 bidiLevel;
+        };
+
         template<typename T>
         struct aligned_buffer
         {
@@ -185,34 +200,34 @@ namespace Microsoft::Console::Render
         using f32x2 = vec2<f32>;
         using f32x4 = vec4<f32>;
 
-        union glyph_entry
+        struct glyph_entry_attributes
         {
-            uint32_t value;
-            struct
-            {
-                uint32_t codepoint : 20;
-                uint32_t wide : 1;
-                uint32_t bold : 1;
-                uint32_t italic : 1;
-            };
+            wchar_t bold : 1;
+            wchar_t italic : 1;
+            wchar_t cells : 4;
+        };
 
-            constexpr bool operator==(const glyph_entry& other) const noexcept
+        struct glyph_entry
+        {
+            wchar_t chars[15];
+            glyph_entry_attributes attributes;
+
+            bool operator==(const glyph_entry& other) const noexcept
             {
-                return value == other.value;
+                return memcmp(this, &other, sizeof(glyph_entry)) == 0;
             }
         };
 
         struct glyph_entry_hasher
         {
-            constexpr size_t operator()(glyph_entry entry) const noexcept
+            size_t operator()(const glyph_entry& entry) const noexcept
             {
-                uint64_t x = entry.value;
-                x ^= x >> 33;
-                x *= UINT64_C(0xff51afd7ed558ccd);
-                x ^= x >> 33;
-                return static_cast<size_t>(x);
+                static_assert(sizeof(entry) == 32);
+                return static_cast<size_t>(XXH3_len_32_64b(&entry));
             }
         };
+
+        static uint64_t XXH3_len_32_64b(const void* data) noexcept;
 
     private:
         // D3D constant buffers sizes must be a multiple of 16 bytes.
@@ -261,10 +276,12 @@ namespace Microsoft::Console::Render
         void _updateConstantBuffer() const;
 
         // text handling
-        IDWriteTextFormat* _getTextFormat(bool bold, bool italic) const noexcept { return _r.textFormats[italic][bold].get(); }
+        void _processBufferLine(u16 y);
+        void _emplaceGlyph(const wchar_t* key, size_t keyLen, u16 y, u16 x1, u16 x2);
+        IDWriteTextFormat* _getTextFormat(bool bold, bool italic) const noexcept;
         wil::com_ptr<IDWriteTextFormat> _createTextFormat(const wchar_t* fontFamilyName, DWRITE_FONT_WEIGHT fontWeight, DWRITE_FONT_STYLE fontStyle, float fontSize, const wchar_t* localeName) const;
         u16x2 _allocateAtlasCell() noexcept;
-        void _drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>& pair) const;
+        void _drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 16>>& pair) const;
         void _drawCursor() const;
         void _copyScratchpadCell(uint32_t scratchpadIndex, u16x2 target, uint32_t copyFlags = 0) const;
 
@@ -278,6 +295,8 @@ namespace Microsoft::Console::Render
         {
             wil::com_ptr<ID2D1Factory> d2dFactory;
             wil::com_ptr<IDWriteFactory> dwriteFactory;
+        wil::com_ptr<IDWriteFontFallback> systemFontFallback;
+            wil::com_ptr<IDWriteTextAnalyzer1> textAnalyzer;
             bool isWindows10OrGreater = true;
         } _sr;
 
@@ -307,10 +326,12 @@ namespace Microsoft::Console::Render
             // Resources dependent on _api.sizeInPixel
             aligned_buffer<cell> cells;
             // Resources dependent on _api.cellSize
-            robin_hood::unordered_flat_map<glyph_entry, std::array<u16x2, 2>, glyph_entry_hasher> glyphs;
-            std::vector<til::pair<glyph_entry, std::array<u16x2, 2>>> glyphQueue;
+            std::unordered_map<glyph_entry, std::array<u16x2, 16>, glyph_entry_hasher> glyphs;
+            std::vector<til::pair<glyph_entry, std::array<u16x2, 16>>> glyphQueue;
             u16x2 atlasSizeInPixel;
             u16x2 atlasPosition;
+            // This thing is just cached information of the locale used for textFormats
+            std::wstring localeName;
         } _r;
 
         struct api_state
@@ -332,9 +353,17 @@ namespace Microsoft::Console::Render
 
         struct render_api_state
         {
+            std::wstring bufferLine;
+            std::vector<u16> bufferLinePos;
+            std::vector<TextAnalyzerResult> analysisResults;
+            std::vector<UINT16> clusterMap;
+            std::vector<DWRITE_SHAPING_TEXT_PROPERTIES> textProps;
+            std::vector<UINT16> glyphIndices;
+            std::vector<DWRITE_SHAPING_GLYPH_PROPERTIES> glyphProps;
+
             til::rectangle dirtyArea;
             u32x2 currentColor{};
-            glyph_entry attributes{};
+            glyph_entry_attributes attributes{};
             u32 backgroundColor = ~u32(0);
             u32 selectionColor = 0x7fffffff;
         } _rapi;
